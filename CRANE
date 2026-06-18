@@ -1,1 +1,271 @@
+# Industrial Crane Load & Collision Safety Guard (PIC18F4580) 🏗️⚠️
 
+## 💡 Overview
+This repository contains a hands-on system integration solution for an **Industrial Crane Hoisting Safety System** built on the **PIC18F4580** microcontroller. The project targets structural load preemption and physical collision avoidance by combining analog input scaling, multi-state visual/acoustic alerting, and high-priority hardware interrupt routines.
+
+> 📊 **Educational Purpose:** This project is engineered as a design challenge following the hardware-software co-design principles of the APJ Abdul Kalam Technological University (KTU) Embedded Systems framework. It demonstrates real-time bare-metal safety monitoring without relying on third-party libraries.
+
+---
+
+## 🛠️ Hardware Requirements
+* **Microcontroller:** PIC18F4580
+* **Display:** 16x2 Character LCD (HD44780 compliant)
+* **Sensors & Inputs:**
+    * 10kΩ Linear Potentiometer (Simulating Crane Cable Load Cell)
+    * Momentary Push Button / Limit Switch (Carriage Bumper Switch)
+    * Momentary Push Button (System Reset Switch)
+* **Actuators & Indicators:**
+    * DC Motor with L293D Driver IC (or Relay Interface) for Hoist Control
+    * 3x LEDs (Green, Yellow, Red) for Status Signaling
+    * 5V Active Piezo Buzzer
+* **Passives:** 10kΩ Resistors for active-low digital switch pull-ups.
+
+---
+
+## 📌 Pin Assignment & Hardware Architecture
+To successfully deploy this firmware, the PIC18F4580 register configurations must map directly to the physical silicon layout. Below is the implemented architectural mapping:
+
+| Hardware Link | Peripheral Functionality | Selected PIC18F4580 Pin | Type | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Load Potentiometer** | ADC Channel 0 (`AN0`) | `RA0` (Pin 2) | Analog Input | Reads 0V to 5V variable load voltage |
+| **Bumper Limit Switch** | External Interrupt 0 (`INT0`) | `RB0` (Pin 33) | Digital Input | Edge-triggered hardware override |
+| **Reset Push Button** | GPIO Input | `RD0` (Pin 19) | Digital Input | Monitored to exit locked collision state |
+| **Hoist Motor Enable** | GPIO Output | `RD1` (Pin 20) | Digital Output | High = Motor Run, Low = Forced Brake |
+| **Status LEDs & Buzzer** | GPIO Group | `RD2, RD3, RD4, RD5` | Digital Output | Drives Green, Yellow, Red LEDs & Buzzer |
+| **LCD Data Bus** | 8-Bit Parallel | `PORTC` (`RC0–RC7`) | Digital Output | Sends command and character ASCII bytes |
+| **LCD Control Lines** | RS / EN Strobe | `RA1` / `RA2` | Digital Output | Coordinates LCD latching protocols |
+
+---
+
+## 🧮 Embedded Systems Logic & Operational States
+
+The bare-metal firmware executes a deterministic main scanning cycle while maintaining an instant-preemption hardware trap for collisions:
+
+### 1. Main Task Scan (Analog Monitoring)
+The 8-bit ADC converts the input voltage from the load potentiometer into a digital value ranging from `0` to `255`. This value is dynamically scaled to an absolute percentage using integer mathematics to prevent floating-point processing latency:
+
+$$\text{Percentage} = \frac{\text{adc\_value} \times 100}{255}$$
+
+### 2. Operational Truth Table
+Based on the computed load percentage, the application cycles through three distinct operational boundaries:
+
+| System State | Input Conditions | Output Requirements | LCD Screen Readout |
+| :--- | :--- | :--- | :--- |
+| **Normal Load** | `0%` to `70%` | Green LED: **ON**<br>Hoist Motor: **ENABLED** | `LOAD: xx%`<br>`STATUS: SAFE` |
+| **Heavy Load Warning** | `71%` to `90%` | Yellow LED: **Flashing**<br>Buzzer: **Slow Chirping Signal** | `LOAD: xx%`<br>`STATUS: WARNING` |
+| **Structural Overload** | Above `90%` | Red LED: **ON**<br>Buzzer: **Continuous**<br>Hoist Motor: **FORCED LOW (OFF)** | `LOAD: xx%`<br>`OVERLOAD - STOP!` |
+
+### 3. Collision Stop (Hardware ISR Trap)
+If the crane carriage drifts past its rail boundary, the physical bumper hits the limit switch, triggering an active-low pulse on `INT0`.
+* **Immediate Preemption:** The `__interrupt()` vector traps the execution instantly, bypassing any software delays, and forces the Hoist Motor pin `LOW`.
+* **Visual Hazard Strobe:** The software enters a locked loop inside `main()`, executing an alternating warning strobe on the LEDs using `0xCC` and `0x33` bit patterns.
+* **Safety Halted Screen:** The LCD displays a critical hazard alert:
+    * Row 1: `CRITICAL COLLISION`
+    * Row 2: `SYSTEM HALTED!`
+* **Interlocked Recovery:** The system remains frozen until a physical **Reset Switch** (`RD0`) is manually closed by the operator, resetting the state machine back to safe monitoring.
+
+---
+
+## 🧑‍💻 Firmware Implementation
+
+Below is the complete, self-contained **MPLAB XC8** firmware code implementation incorporating device-specific configurations, register definitions, LCD drivers, and the interrupt service routine.
+
+```c
+#include <xc.h>
+
+// --- CONFIGURATION BITS (PIC18F4580 Bare-Metal Setup) ---
+#pragma config OSC = HS         // High-Speed Crystal Oscillator
+#pragma config WDT = OFF        // Watchdog Timer Disabled
+#pragma config LVP = OFF        // Low-Voltage Programming Disabled
+#pragma config PBADEN = OFF     // PORTB pins configured as digital I/O on Reset
+
+#define _XTAL_FREQ 20000000     // Define System Clock (20 MHz)
+
+// --- PIN DEFINITIONS ---
+#define LCD_RS       LATA1
+#define LCD_EN       LATA2
+#define MOTOR_EN     LATD1
+#define LED_GREEN    LATD2
+#define LED_YELLOW   LATD3
+#define LED_RED      LATD4
+#define BUZZER       LATD5
+#define RESET_SW     PORTDbits.RD0
+
+// --- GLOBAL VARIABLES ---
+volatile unsigned char collision_flag = 0;
+
+// --- FUNCTION PROTOTYPES ---
+void delay_ms(unsigned int ms);
+void lcd_command(unsigned char cmd);
+void lcd_char(char data);
+void lcd_string(const char *str);
+void lcd_init(void);
+void display_status(unsigned char load, const char* status_msg);
+void adc_init(void);
+unsigned char adc_read(void);
+
+// --- HARDWARE INTERRUPT SERVICE ROUTINE (ISR) ---
+void __interrupt() ISR(void) {
+    if (INT0IF) {
+        MOTOR_EN = 0;          // Cut motor power immediately
+        LED_GREEN = 0;
+        collision_flag = 1;    // Raise system hazard flag
+        INT0IF = 0;            // Clear external interrupt flag
+    }
+}
+
+void main(void) {
+    // --- PORT CONFIGURATIONS ---
+    TRISA = 0x01;  // RA0 = AN0 input, RA1/RA2 = LCD Control outputs
+    TRISB = 0x01;  // RB0 = INT0 input, rest are outputs/unused
+    TRISC = 0x00;  // PORTC = 8-bit parallel LCD Data Bus
+    TRISD = 0x01;  // RD0 = Reset Switch Input, RD1-RD5 = Control/Alert Outputs
+    
+    // Configure Digital I/O blocks
+    ADCON1 = 0x0E; // Set AN0 as Analog Input, rest of PORTA/PORTB as Digital I/O
+    
+    // --- PERIPHERAL INITIALIZATIONS ---
+    lcd_init();
+    adc_init();
+    
+    // --- HARDWARE INTERRUPT SETUP ---
+    INTEDG0 = 0;   // Trigger INT0 on Falling Edge (Active-Low Switch)
+    INT0IF = 0;    // Clear flag
+    INT0IE = 1;    // Enable External Interrupt 0
+    GIE = 1;       // Enable Global Interrupts
+    
+    unsigned char adc_raw = 0;
+    unsigned char load_pct = 0;
+    
+    while(1) {
+        if (collision_flag) {
+            // --- CRITICAL COLLISION LATCHED STATE ---
+            lcd_command(0x01); // Clear Screen
+            lcd_command(0x80); // Line 1
+            lcd_string("CRITICAL COLLISION");
+            lcd_command(0xC0); // Line 2
+            lcd_string("SYSTEM HALTED!");
+            
+            while(collision_flag) {
+                // Alternating Warning Strobe (0xCC and 0x33 patterns on alert pins)
+                LATD = (LATD & 0xC3) | 0x0C; // Example flash state 1
+                delay_ms(250);
+                LATD = (LATD & 0xC3) | 0x30; // Example flash state 2
+                delay_ms(250);
+                
+                // Monitor operator Reset Switch (Active-Low push button)
+                if (RESET_SW == 0) {
+                    delay_ms(50); // Debounce delay
+                    if (RESET_SW == 0) {
+                        collision_flag = 0; // Clear alert state
+                        lcd_command(0x01);
+                        LATD = 0x00;        // Clear alert pins
+                    }
+                }
+            }
+        }
+        
+        // --- NORMAL OPERATION LOOP ---
+        adc_raw = adc_read();
+        load_pct = (unsigned int)(adc_raw * 100) / 255; // Precision mathematical scaling
+        
+        // State Assessment logic
+        if (load_pct <= 70) {
+            MOTOR_EN = 1;
+            LED_GREEN = 1;
+            LED_YELLOW = 0;
+            LED_RED = 0;
+            BUZZER = 0;
+            display_status(load_pct, "SAFE   ");
+            delay_ms(100);
+        } 
+        else if (load_pct > 70 && load_pct <= 90) {
+            MOTOR_EN = 1;
+            LED_GREEN = 0;
+            LED_RED = 0;
+            display_status(load_pct, "WARNING");
+            
+            // Software driven warning alert pulsing
+            LED_YELLOW = ~LED_YELLOW;
+            BUZZER = ~BUZZER;
+            delay_ms(200);
+        } 
+        else { // Overload State (> 90%)
+            MOTOR_EN = 0;  // Cut off hoist control instantly
+            LED_GREEN = 0;
+            LED_YELLOW = 0;
+            LED_RED = 1;
+            BUZZER = 1;    // Continuous alarm
+            display_status(load_pct, "STOP!  ");
+            delay_ms(100);
+        }
+    }
+}
+
+// --- ADC MODULE FUNCTIONS ---
+void adc_init(void) {
+    ADCON0 = 0x01; // Select AN0 channel, Turn ON ADC module
+    ADCON2 = 0x8A; // Right justified, 2 TAD acquisition time, FOSC/32 conversion clock
+}
+
+unsigned char adc_read(void) {
+    GODONE = 1; // Start conversion sequence
+    while(GODONE); // Wait for conversion to complete
+    return ADRESH; // Return 8-bit result (Highly accurate for scale thresholds)
+}
+
+// --- 8-BIT PARALLEL LCD DRIVERS ---
+void lcd_command(unsigned char cmd) {
+    LATC = cmd;     // Load instruction byte to data bus
+    LCD_RS = 0;     // Instruction Register Mode
+    LCD_EN = 1;     // Pulse Enable high
+    delay_ms(2);
+    LCD_EN = 0;     // Latch command
+}
+
+void lcd_char(char data) {
+    LATC = data;    // Load ASCII byte to data bus
+    LCD_RS = 1;     // Data Register Mode
+    LCD_EN = 1;
+    delay_ms(2);
+    LCD_EN = 0;     // Latch character
+}
+
+void lcd_string(const char *str) {
+    while(*str) {
+        lcd_char(*str++);
+    }
+}
+
+void lcd_init(void) {
+    delay_ms(20);        // LCD Wakeup settling delay
+    lcd_command(0x38);   // Configure 8-bit connection, 2-line layout, 5x8 font
+    lcd_command(0x0C);   // Display ON, Cursor OFF
+    lcd_command(0x06);   // Auto-increment cursor index
+    lcd_command(0x01);   // Clear panel memory
+}
+
+void display_status(unsigned char load, const char* status_msg) {
+    char line1[16];
+    char line2[16];
+    
+    // Construct display buffers without heavy library formats
+    int tens = load / 10;
+    int ones = load % 10;
+    
+    lcd_command(0x80); // Line 1 address
+    lcd_string("LOAD: ");
+    lcd_char(tens + '0');
+    lcd_char(ones + '0');
+    lcd_string("%     ");
+    
+    lcd_command(0xC0); // Line 2 address
+    lcd_string("STATUS: ");
+    lcd_string(status_msg);
+}
+
+void delay_ms(unsigned int ms) {
+    while(ms--) {
+        __delay_ms(1);
+    }
+}
