@@ -105,7 +105,7 @@ The code was written from scratch in **MPLAB X IDE** using the **XC8 Compiler**.
 ## Code 
 ```c
 // ==============================================================================
-// Project 22: Industrial Crane Load & Collision Safety Guard
+// Project: Industrial Crane Load & Collision Safety Guard
 // Target: PIC18F4580
 // Compiler: XC8
 // ==============================================================================
