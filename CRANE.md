@@ -102,8 +102,8 @@ The code was written from scratch in **MPLAB X IDE** using the **XC8 Compiler**.
 
 
 
-## Code
-// ==============================================================================
+## Code 
+'''
 // Project 22: Industrial Crane Load & Collision Safety Guard
 // Target: PIC18F4580
 // Compiler: XC8
@@ -341,4 +341,4 @@ void lcd_init(void) {
     lcd_cmd(0x06);          // Entry mode: auto-increment
     lcd_cmd(0x01);          // Clear display
     __delay_ms(5);
-}
+} '''
